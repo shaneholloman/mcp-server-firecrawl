@@ -333,6 +333,7 @@ const scrapeParamsSchema = z.object({
   storeInCache: z.boolean().optional(),
   zeroDataRetention: z.boolean().optional(),
   maxAge: z.number().optional(),
+  lockdown: z.boolean().optional(),
   proxy: z.enum(['basic', 'stealth', 'enhanced', 'auto']).optional(),
   profile: z
     .object({
@@ -440,6 +441,7 @@ If JSON extraction returns empty, minimal, or just navigation content, the page 
 \`\`\`
 **Branding format:** Extracts comprehensive brand identity (colors, fonts, typography, spacing, logo, UI components) for design analysis or style replication.
 **Performance:** Add maxAge parameter for 500% faster scrapes using cached data.
+**Lockdown mode:** Set \`lockdown: true\` to serve the request only from the existing index/cache without any outbound network request. For air-gapped or compliance-constrained use where the request URL itself is considered sensitive. Errors on cache miss. Billed at 5 credits.
 **Returns:** JSON structured data, markdown, branding profile, or other formats as specified.
 ${
   SAFE_MODE
@@ -459,7 +461,11 @@ ${
     const client = getClient(session);
     const transformed = transformScrapeParams(options as Record<string, unknown>);
     const cleaned = removeEmptyTopLevel(transformed);
-    log.info('Scraping URL', { url: String(url) });
+    if (cleaned.lockdown) {
+      log.info('Scraping URL (lockdown)');
+    } else {
+      log.info('Scraping URL', { url: String(url) });
+    }
     const res = await client.scrape(String(url), {
       ...cleaned,
       origin: ORIGIN,

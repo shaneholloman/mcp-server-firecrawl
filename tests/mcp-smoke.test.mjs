@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
+import { createServer } from 'node:http';
 import net from 'node:net';
 import test from 'node:test';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -66,6 +67,62 @@ async function stopChild(child) {
       if (child.exitCode === null) child.kill('SIGKILL');
     }),
   ]);
+}
+
+async function startFakeFirecrawlApi() {
+  const requests = [];
+  const server = createServer(async (req, res) => {
+    let body = '';
+    req.setEncoding('utf8');
+    for await (const chunk of req) body += chunk;
+
+    const parsedBody = body ? JSON.parse(body) : undefined;
+    requests.push({
+      body: parsedBody,
+      headers: req.headers,
+      method: req.method,
+      url: req.url,
+    });
+
+    if (req.method === 'POST' && req.url === '/v2/search') {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(
+        JSON.stringify({
+          creditsUsed: 1,
+          data: {
+            web: [
+              {
+                title: 'Example Domain',
+                url: 'https://example.com/',
+              },
+            ],
+          },
+          id: '00000000-0000-4000-8000-000000000000',
+          success: true,
+        })
+      );
+      return;
+    }
+
+    res.writeHead(404, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ error: `Unhandled ${req.method} ${req.url}` }));
+  });
+
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  const address = server.address();
+  assert.equal(typeof address, 'object');
+
+  return {
+    requests,
+    url: `http://127.0.0.1:${address.port}`,
+    close: () =>
+      new Promise((resolve, reject) => {
+        server.close((error) => (error ? reject(error) : resolve()));
+      }),
+  };
 }
 
 test('HTTP cloud transport preserves Firecrawl OAuth and well-known routes', async (t) => {
@@ -262,5 +319,62 @@ test('stdio transport initializes and lists Firecrawl tools', async (t) => {
   assert.ok(toolNames.includes('firecrawl_scrape'));
   assert.ok(toolNames.includes('firecrawl_search'));
   assert.ok(toolNames.includes('firecrawl_parse'));
+  assert.equal(stderr.includes('TypeError'), false, stderr);
+});
+
+test('stdio transport calls Firecrawl API through a tool end to end', async (t) => {
+  const fakeApi = await startFakeFirecrawlApi();
+  t.after(() => fakeApi.close());
+
+  const child = spawnServer({
+    FIRECRAWL_API_KEY: 'fc-test',
+    FIRECRAWL_API_URL: fakeApi.url,
+  });
+  let stderr = '';
+  child.stderr.on('data', (chunk) => {
+    stderr += chunk;
+  });
+  t.after(() => stopChild(child));
+
+  const client = new StdioMcpClient(child);
+  await client.request('initialize', {
+    capabilities: {},
+    clientInfo: { name: 'firecrawl-mcp-tool-e2e', version: '0.0.0' },
+    protocolVersion: '2025-06-18',
+  });
+  client.notify('notifications/initialized');
+
+  const result = await client.request('tools/call', {
+    arguments: { limit: 1, query: 'example domain' },
+    name: 'firecrawl_search',
+  });
+
+  assert.equal(fakeApi.requests.length, 1);
+  assert.equal(fakeApi.requests[0].method, 'POST');
+  assert.equal(fakeApi.requests[0].url, '/v2/search');
+  assert.equal(fakeApi.requests[0].headers.authorization, 'Bearer fc-test');
+  assert.deepEqual(fakeApi.requests[0].body, {
+    limit: 1,
+    origin: 'mcp-fastmcp',
+    query: 'example domain',
+  });
+
+  assert.notEqual(result.isError, true);
+  assert.equal(result.content.length, 1);
+  assert.equal(result.content[0].type, 'text');
+  const toolPayload = JSON.parse(result.content[0].text);
+  assert.deepEqual(toolPayload, {
+    creditsUsed: 1,
+    data: {
+      web: [
+        {
+          title: 'Example Domain',
+          url: 'https://example.com/',
+        },
+      ],
+    },
+    id: '00000000-0000-4000-8000-000000000000',
+    success: true,
+  });
   assert.equal(stderr.includes('TypeError'), false, stderr);
 });

@@ -1,12 +1,12 @@
 #!/usr/bin/env node
 import FirecrawlApp from '@mendable/firecrawl-js';
 import dotenv from 'dotenv';
+import { FastMCP, type Logger } from 'fastmcp';
 import type { IncomingHttpHeaders } from 'http';
 import { readFile } from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import path from 'node:path';
 import { z } from 'zod';
-import { FastMCP, type Logger } from './fastmcp/FastMCP';
 import { registerMonitorTools } from './monitor';
 import { registerResearchTools } from './research';
 
@@ -31,6 +31,16 @@ interface SessionData {
   keylessClientIp?: string;
   [key: string]: unknown;
 }
+
+type ToolLogger = Pick<Logger, 'debug' | 'error' | 'info' | 'warn'>;
+
+const authResultByRequest = Symbol('firecrawlMcpAuthResult');
+
+type MCPAuthRequest = {
+  headers: IncomingHttpHeaders;
+  url?: string;
+  [authResultByRequest]?: Promise<SessionData>;
+};
 
 function normalizeHeader(
   value: string | string[] | undefined
@@ -92,6 +102,38 @@ function getMcpResourceUrl(): string {
 // protectedResource config, so the URL is fully derived from the MCP resource.
 function getOAuthProtectedResourceMetadataUrl(): string {
   return `${new URL(getMcpResourceUrl()).origin}/.well-known/oauth-protected-resource`;
+}
+
+function escapeWWWAuthenticateValue(value: string): string {
+  return value.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+}
+
+function createOAuthChallengeResponse(error: unknown): Response | undefined {
+  if (!isMcpOAuthEnabled()) {
+    return undefined;
+  }
+
+  const errorMessage =
+    error instanceof Error ? error.message : String(error || 'Unauthorized');
+  const wwwAuthenticate = [
+    `resource_metadata="${escapeWWWAuthenticateValue(getOAuthProtectedResourceMetadataUrl())}"`,
+    'error="invalid_token"',
+    `error_description="${escapeWWWAuthenticateValue(errorMessage)}"`,
+  ].join(', ');
+
+  return new Response(
+    JSON.stringify({
+      error: 'invalid_token',
+      error_description: errorMessage,
+    }),
+    {
+      headers: {
+        'Content-Type': 'application/json',
+        'WWW-Authenticate': `Bearer ${wwwAuthenticate}`,
+      },
+      status: 401,
+    }
+  );
 }
 
 function getOAuthIntrospectionEndpoint(): string {
@@ -159,6 +201,95 @@ async function resolveCredentialFromHeaders(
     return bearer;
   }
   return undefined;
+}
+
+async function authenticateRequest(
+  request?: MCPAuthRequest
+): Promise<SessionData> {
+  // FastMCP invokes `authenticate(undefined)` for the stdio transport
+  // because there is no HTTP request context. Without this null guard,
+  // accessing `request.headers` throws a TypeError, FastMCP silently
+  // swallows it, and every subsequent tool call fails with
+  // "Unauthorized: API key is required when not using a self-hosted
+  // instance" even though `FIRECRAWL_API_KEY` is set in env.
+  const headerCred = request?.headers
+    ? await resolveCredentialFromHeaders(request.headers)
+    : undefined;
+  const envCred = resolveCredentialFromEnv();
+
+  if (process.env.CLOUD_SERVICE === 'true') {
+    if (!headerCred) {
+      // Keyless free tier over the hosted MCP: serve it only when a forwarding
+      // secret is configured, we know the end-user's client IP (so the API can
+      // rate-limit per real IP, not the shared server IP), AND that IP still
+      // has free quota. If the IP is out of quota (or keyless is off), fall
+      // through to throw so FastMCP emits the OAuth 401 + WWW-Authenticate
+      // challenge — i.e. prompt the user to connect an account exactly when
+      // their free quota runs out.
+      const clientIp = extractClientIp(request);
+      if (
+        process.env.KEYLESS_PROXY_SECRET &&
+        clientIp &&
+        (await keylessEligible(clientIp))
+      ) {
+        return { firecrawlApiKey: undefined, keylessClientIp: clientIp };
+      }
+      throw new Error(
+        'Firecrawl credentials required: OAuth access token (Authorization: Bearer fco_...) or API key (x-firecrawl-api-key)'
+      );
+    }
+    return { firecrawlApiKey: headerCred };
+  }
+
+  const credential = headerCred ?? envCred;
+
+  // Self-hosted / stdio / HTTP streamable — headers supply MCP OAuth token when present
+  const httpStreaming = isHttpStreamingTransport();
+  if (
+    !httpStreaming &&
+    !process.env.FIRECRAWL_API_KEY &&
+    !process.env.FIRECRAWL_API_URL
+  ) {
+    // No credential and no self-hosted URL: run in keyless mode. scrape and
+    // search work for free (rate-limited per IP) against the Firecrawl cloud;
+    // every other tool needs an API key and will return Unauthorized.
+    console.error(
+      'No FIRECRAWL_API_KEY or FIRECRAWL_API_URL set — running in keyless mode. ' +
+        'firecrawl_scrape and firecrawl_search are free (rate-limited per IP) against the Firecrawl cloud; ' +
+        'other tools require an API key (get one free at https://firecrawl.dev).'
+    );
+  }
+
+  if (httpStreaming && !credential && !process.env.FIRECRAWL_API_URL) {
+    console.error(
+      'HTTP MCP transport requires FIRECRAWL_API_URL and/or credentials (OAuth: Authorization Bearer fco_..., or FIRECRAWL_API_KEY / FIRECRAWL_OAUTH_TOKEN)'
+    );
+    process.exit(1);
+  }
+
+  return { firecrawlApiKey: credential };
+}
+
+async function authenticateWithOAuthChallenge(
+  request?: MCPAuthRequest
+): Promise<SessionData> {
+  if (request?.[authResultByRequest]) {
+    return request[authResultByRequest];
+  }
+
+  const authResult = authenticateRequest(request).catch((error) => {
+    const oauthChallenge = createOAuthChallengeResponse(error);
+    if (oauthChallenge) {
+      throw oauthChallenge;
+    }
+    throw error;
+  });
+
+  if (request) {
+    request[authResultByRequest] = authResult;
+  }
+
+  return authResult;
 }
 
 function removeEmptyTopLevel<T extends Record<string, any>>(
@@ -266,75 +397,8 @@ const server = new FastMCP<SessionData>({
       resourceName: 'Firecrawl MCP',
       scopesSupported: ['firecrawl:global'],
     },
-    protectedResourceMetadataUrl: getOAuthProtectedResourceMetadataUrl(),
   },
-  authenticate: async (request?: {
-    headers: IncomingHttpHeaders;
-    url?: string;
-  }): Promise<SessionData> => {
-    // FastMCP invokes `authenticate(undefined)` for the stdio transport
-    // because there is no HTTP request context. Without this null guard,
-    // accessing `request.headers` throws a TypeError, FastMCP silently
-    // swallows it, and every subsequent tool call fails with
-    // "Unauthorized: API key is required when not using a self-hosted
-    // instance" even though `FIRECRAWL_API_KEY` is set in env.
-    const headerCred = request?.headers
-      ? await resolveCredentialFromHeaders(request.headers)
-      : undefined;
-    const envCred = resolveCredentialFromEnv();
-
-    if (process.env.CLOUD_SERVICE === 'true') {
-      if (!headerCred) {
-        // Keyless free tier over the hosted MCP: serve it only when a forwarding
-        // secret is configured, we know the end-user's client IP (so the API can
-        // rate-limit per real IP, not the shared server IP), AND that IP still
-        // has free quota. If the IP is out of quota (or keyless is off), fall
-        // through to throw so FastMCP emits the OAuth 401 + WWW-Authenticate
-        // challenge — i.e. prompt the user to connect an account exactly when
-        // their free quota runs out.
-        const clientIp = extractClientIp(request);
-        if (
-          process.env.KEYLESS_PROXY_SECRET &&
-          clientIp &&
-          (await keylessEligible(clientIp))
-        ) {
-          return { firecrawlApiKey: undefined, keylessClientIp: clientIp };
-        }
-        throw new Error(
-          'Firecrawl credentials required: OAuth access token (Authorization: Bearer fco_...) or API key (x-firecrawl-api-key)'
-        );
-      }
-      return { firecrawlApiKey: headerCred };
-    }
-
-    const credential = headerCred ?? envCred;
-
-    // Self-hosted / stdio / HTTP streamable — headers supply MCP OAuth token when present
-    const httpStreaming = isHttpStreamingTransport();
-    if (
-      !httpStreaming &&
-      !process.env.FIRECRAWL_API_KEY &&
-      !process.env.FIRECRAWL_API_URL
-    ) {
-      // No credential and no self-hosted URL: run in keyless mode. scrape and
-      // search work for free (rate-limited per IP) against the Firecrawl cloud;
-      // every other tool needs an API key and will return Unauthorized.
-      console.error(
-        'No FIRECRAWL_API_KEY or FIRECRAWL_API_URL set — running in keyless mode. ' +
-          'firecrawl_scrape and firecrawl_search are free (rate-limited per IP) against the Firecrawl cloud; ' +
-          'other tools require an API key (get one free at https://firecrawl.dev).'
-      );
-    }
-
-    if (httpStreaming && !credential && !process.env.FIRECRAWL_API_URL) {
-      console.error(
-        'HTTP MCP transport requires FIRECRAWL_API_URL and/or credentials (OAuth: Authorization Bearer fco_..., or FIRECRAWL_API_KEY / FIRECRAWL_OAUTH_TOKEN)'
-      );
-      process.exit(1);
-    }
-
-    return { firecrawlApiKey: credential };
-  },
+  authenticate: authenticateWithOAuthChallenge,
   // Lightweight health endpoint for LB checks
   health: {
     enabled: true,
@@ -342,10 +406,15 @@ const server = new FastMCP<SessionData>({
     path: '/health',
     status: 200,
   },
-  ...(openAiAppsChallengeToken
-    ? { openaiAppsChallenge: { token: openAiAppsChallengeToken } }
-    : {}),
 });
+
+if (openAiAppsChallengeToken) {
+  server
+    .getApp()
+    .get('/.well-known/openai-apps-challenge', (context) =>
+      context.text(openAiAppsChallengeToken)
+    );
+}
 
 function createClient(apiKey?: string): FirecrawlApp {
   const config: any = {
@@ -841,7 +910,7 @@ function buildCurlUploadCommand(
 async function executeHostedParse(
   args: ParseToolArgs,
   session: SessionData | undefined,
-  log: Logger
+  log: ToolLogger
 ): Promise<string> {
   const hasFilePath =
     typeof args.filePath === 'string' && args.filePath.length > 0;
@@ -2426,10 +2495,7 @@ Add \`"parsers": ["pdf"]\` (optionally with \`pdfOptions.maxPages\`) when parsin
 **Returns:** Phase 1 hosted upload instructions or a parsed document with markdown, html, links, summary, json, or query results depending on the requested formats.
 `,
   parameters: parseParamsSchema,
-  execute: async (
-    args: unknown,
-    { session, log }: { session?: SessionData; log: Logger }
-  ): Promise<string> => {
+  execute: async (args: unknown, { session, log }): Promise<string> => {
     if (process.env.CLOUD_SERVICE === 'true') {
       return executeHostedParse(args as ParseToolArgs, session, log);
     }

@@ -10,7 +10,7 @@
  */
 
 import { z } from 'zod';
-import type { FastMCP } from './fastmcp/FastMCP';
+import type { FastMCP } from 'fastmcp';
 
 interface SessionData {
   firecrawlApiKey?: string;
